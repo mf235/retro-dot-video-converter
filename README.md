@@ -21,6 +21,10 @@ MP4動画をレトロ風ドット絵（PC98/MSX風）に変換できる、プリ
 このツールは内部でFFmpegを使用しています。
 ツールと同じフォルダにffmpeg.exeを置いてください。
 
+FFmpegの公式ダウンロード先
+
+FFmpeg 公式サイト (Downloadページ): https://ffmpeg.org/download.html
+
 ## 使い方
 
 1. **アプリを起動する**
