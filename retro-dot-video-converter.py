@@ -66,7 +66,7 @@ class RetroVideoConverter:
         self.root.title("レトロ風ドット絵 動画変換ツール")
 
         window_width = 1280
-        window_height = 900
+        window_height = 950
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         x_coordinate = (screen_width // 2) - (window_width // 2)
