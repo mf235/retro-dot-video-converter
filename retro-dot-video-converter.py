@@ -16,6 +16,9 @@ import time
 import shutil
 import tempfile
 import subprocess
+import threading
+import queue
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 try:
@@ -66,7 +69,7 @@ class RetroVideoConverter:
         self.root.title("レトロ風ドット絵 動画変換ツール")
 
         window_width = 1280
-        window_height = 950
+        window_height = 1000
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         x_coordinate = (screen_width // 2) - (window_width // 2)
@@ -86,8 +89,24 @@ class RetroVideoConverter:
         self.last_preview_settings_key = None
         self.input_img_tk = None
         self.output_img_tk = None
+        self.ui_queue = queue.Queue()
 
         self.size_map = {}
+
+        self.var_folder_overwrite = tk.BooleanVar(value=False)
+        self.last_loaded_size_labels = []
+
+        # 再エンコード時の画質/容量プリセット。video-cutter.py と同じ内容。
+        # CRFを下げるほど高画質・大容量、上げるほど低容量・劣化増。
+        self.reencode_presets = {
+            "最高画質 CRF18 / slow": {"crf": "18", "preset": "slow", "audio_bitrate": "192k"},
+            "おすすめ 高画質小さめ CRF20 / slow": {"crf": "20", "preset": "slow", "audio_bitrate": "160k"},
+            "標準小さめ CRF23 / slow": {"crf": "23", "preset": "slow", "audio_bitrate": "128k"},
+            "容量優先 CRF25 / veryslow": {"crf": "25", "preset": "veryslow", "audio_bitrate": "96k"},
+            "かなり小さめ CRF28 / veryslow": {"crf": "28", "preset": "veryslow", "audio_bitrate": "96k"},
+        }
+        self.default_reencode_preset_name = "おすすめ 高画質小さめ CRF20 / slow"
+        self.reencode_quality_var = tk.StringVar(value=self.default_reencode_preset_name)
 
         main_frame = tk.Frame(root)
         main_frame.pack(fill="both", expand=True, padx=15, pady=10)
@@ -179,6 +198,16 @@ class RetroVideoConverter:
         tk.Entry(filename_frame, textvariable=self.var_output_name, width=45).pack(side="left", padx=(5, 5))
         tk.Label(filename_frame, text="※空なら 元ファイル名_retro.mp4", fg="#777777", font=("メイリオ", 9)).pack(side="left")
 
+        self.chk_folder_overwrite = tk.Checkbutton(
+            button_frame,
+            text="✅フォルダの場合は上書きモードで即時変換保存する",
+            variable=self.var_folder_overwrite,
+            font=("メイリオ", 10, "bold"),
+            fg="red",
+            anchor="w"
+        )
+        self.chk_folder_overwrite.pack(anchor="w", pady=(0, 8))
+
         self.btn_convert = tk.Button(
             button_frame,
             text="2. 動画をレトロ風に変換して保存！",
@@ -214,9 +243,8 @@ class RetroVideoConverter:
         self.preset_combo.bind("<<ComboboxSelected>>", self.apply_preset)
 
         tk.Label(right_frame, text="出力サイズ", font=("メイリオ", 10), anchor="w").pack(fill="x", pady=(8, 0))
-        self.size_var = tk.StringVar(value="動画を読み込んでください")
-        self.size_combo = ttk.Combobox(right_frame, textvariable=self.size_var, state="disabled", width=38)
-        self.size_combo["values"] = ("動画を読み込んでください",)
+        self.size_var = tk.StringVar(value="幅 320（縦横比維持）")
+        self.size_combo = ttk.Combobox(right_frame, textvariable=self.size_var, state="readonly", width=38)
         self.size_combo.pack(anchor="w", pady=2)
         self.size_combo.bind("<<ComboboxSelected>>", self.on_size_selected)
 
@@ -232,6 +260,18 @@ class RetroVideoConverter:
         self.custom_h_entry.pack(side="left", padx=(2, 5))
         self.btn_custom_apply = tk.Button(custom_frame, text="適用", command=self.apply_custom_size, state="disabled")
         self.btn_custom_apply.pack(side="left")
+
+        tk.Label(right_frame, text="エンコ品質", font=("メイリオ", 10), anchor="w").pack(fill="x", pady=(8, 0))
+        self.quality_combo = ttk.Combobox(
+            right_frame,
+            textvariable=self.reencode_quality_var,
+            state="readonly",
+            width=38,
+        )
+        self.quality_combo["values"] = tuple(self.reencode_presets.keys())
+        self.quality_combo.pack(anchor="w", pady=2)
+
+        self.init_size_options()
 
         tk.Label(right_frame, text="色数", font=("メイリオ", 10), anchor="w").pack(fill="x", pady=(10, 0))
         self.colors_var = tk.StringVar(value="8")
@@ -334,8 +374,9 @@ class RetroVideoConverter:
 
         notice = (
             "出力は mp4 固定。\n"
-            "ffmpeg が使える場合、元動画の音声を自動コピーします。\n"
-            "サイズ候補は動画の縦横比から自動生成します。"
+            "ffmpeg が使える場合、元動画の音声を自動結合します。\n"
+            "現状維持は各動画のサイズを出力時に自動解決します。\n"
+            "フォルダD&Dの上書きモードはサブフォルダも処理します。"
         )
         tk.Label(right_frame, text=notice, fg="#555555", justify="left", anchor="w").pack(fill="x", pady=(18, 0))
 
@@ -344,10 +385,81 @@ class RetroVideoConverter:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind("<<Drop>>", self.drop_video)
 
+        self.root.after(80, self.poll_ui_queue)
+
+    # ====================== スレッド/UI連携 ======================
+    def poll_ui_queue(self):
+        try:
+            while True:
+                msg = self.ui_queue.get_nowait()
+                kind = msg[0]
+                if kind == "progress":
+                    percent, text = msg[1], msg[2]
+                    if percent is not None:
+                        self.progress_var.set(max(0.0, min(100.0, float(percent))))
+                    if text is not None:
+                        self.lbl_progress.config(text=text)
+                elif kind == "done_single":
+                    output_path, quality_name = msg[1], msg[2]
+                    self.progress_var.set(100)
+                    self.lbl_progress.config(text=f"完了: {output_path}")
+                    self.set_converting_ui(False)
+                    messagebox.showinfo("変換完了", f"動画変換が完了しました！\nエンコ品質: {quality_name}\n{output_path}")
+                elif kind == "done_folder":
+                    converted, failed, backup_root, quality_name = msg[1], msg[2], msg[3], msg[4]
+                    self.progress_var.set(100)
+                    self.set_converting_ui(False)
+                    if failed:
+                        fail_text = "\n".join(f"- {os.path.basename(path)}: {err[:120]}" for path, err in failed[:8])
+                        more = "" if len(failed) <= 8 else f"\n...ほか {len(failed) - 8} 件"
+                        self.lbl_progress.config(text=f"完了（一部失敗）: 成功 {converted} / 失敗 {len(failed)}")
+                        messagebox.showwarning(
+                            "一括変換完了（一部失敗）",
+                            f"変換成功: {converted}件 / 失敗: {len(failed)}件\n"
+                            f"エンコ品質: {quality_name}\n"
+                            f"バックアップ: {backup_root}\n\n{fail_text}{more}"
+                        )
+                    else:
+                        self.lbl_progress.config(text=f"完了: {converted}件 / バックアップ {backup_root}")
+                        messagebox.showinfo(
+                            "一括変換完了",
+                            f"{converted}件の動画を上書き変換しました。\nエンコ品質: {quality_name}\nバックアップ: {backup_root}"
+                        )
+                elif kind == "error":
+                    title, text = msg[1], msg[2]
+                    self.lbl_progress.config(text="エラーで停止")
+                    self.set_converting_ui(False)
+                    messagebox.showerror(title, text)
+        except queue.Empty:
+            pass
+        self.root.after(80, self.poll_ui_queue)
+
+    def post_progress(self, percent=None, text=None):
+        self.ui_queue.put(("progress", percent, text))
+
+    def start_worker(self, target, *args):
+        worker = threading.Thread(target=target, args=args, daemon=True)
+        worker.start()
+        return worker
+
     # ====================== ファイル読み込み ======================
     def drop_video(self, event):
-        files = self.root.tk.splitlist(event.data)
-        valid_files = [f for f in files if os.path.isfile(f) and f.lower().endswith(VIDEO_EXTENSIONS)]
+        paths = self.root.tk.splitlist(event.data)
+        if not paths:
+            return
+
+        folder_paths = [p for p in paths if os.path.isdir(p)]
+        if folder_paths:
+            if self.var_folder_overwrite.get():
+                self.convert_folder_overwrite(folder_paths[0])
+            else:
+                messagebox.showwarning(
+                    "フォルダがドロップされました",
+                    "フォルダを一括変換する場合は、赤字の上書きモードにチェックを入れてからドロップしてね。"
+                )
+            return
+
+        valid_files = [f for f in paths if os.path.isfile(f) and f.lower().endswith(VIDEO_EXTENSIONS)]
         if not valid_files:
             messagebox.showwarning("エラー", "有効な動画ファイルがありません")
             return
@@ -402,13 +514,36 @@ class RetroVideoConverter:
         self.update_preview_from_seek()
 
     # ====================== 出力サイズ候補 ======================
+    def init_size_options(self):
+        """動画未読み込みでも使える基本サイズ候補。フォルダ一括変換でもこの候補を使う。"""
+        self.size_map = {
+            "現状維持": None,
+            "幅 256（縦横比維持）": ("width", 256),
+            "幅 320（縦横比維持）": ("width", 320),
+            "幅 480（縦横比維持）": ("width", 480),
+            "幅 640（縦横比維持）": ("width", 640),
+            "幅 960（縦横比維持）": ("width", 960),
+            "幅 1280（縦横比維持）": ("width", 1280),
+            "幅 1920（縦横比維持）": ("width", 1920),
+        }
+        self.last_loaded_size_labels = []
+        labels = list(self.size_map.keys()) + ["カスタム..."]
+        self.size_combo["values"] = tuple(labels)
+        if self.size_var.get() not in labels:
+            self.size_var.set("現状維持")
+        self.on_size_selected()
+
     def generate_size_options(self):
+        """単体動画読み込み時は、その動画の縦横比に合う固定サイズ候補を追加する。"""
         if self.video_w <= 0 or self.video_h <= 0:
             return
 
-        self.size_map = {}
-        ratio = self.video_w / self.video_h
+        # 以前の読み込み動画由来の候補だけを消し、基本候補とカスタム候補は残す。
+        for label in getattr(self, "last_loaded_size_labels", []):
+            self.size_map.pop(label, None)
+        self.last_loaded_size_labels = []
 
+        ratio = self.video_w / self.video_h
         canonical = [
             ("16:9", 16 / 9, [(256, 144), (320, 180), (480, 270), (640, 360), (960, 540), (1280, 720), (1920, 1080)]),
             ("4:3", 4 / 3, [(256, 192), (320, 240), (480, 360), (640, 480), (800, 600), (1024, 768), (1440, 1080)]),
@@ -424,16 +559,9 @@ class RetroVideoConverter:
                 sizes = candidates
                 break
 
-        labels = []
-        keep_label = f"現状維持 - {even_int(self.video_w)}x{even_int(self.video_h)}"
-        labels.append(keep_label)
-        self.size_map[keep_label] = (even_int(self.video_w), even_int(self.video_h))
-
+        added_labels = []
         if sizes is not None:
-            named = []
             for w, h in sizes:
-                if w <= 0 or h <= 0:
-                    continue
                 if aspect_name == "16:9":
                     label_name = self.size_label_for_width(w, {320: "レトロ小", 480: "レトロ中", 640: "標準", 1280: "高解像度", 1920: "フルHD"})
                 elif aspect_name == "4:3":
@@ -442,27 +570,37 @@ class RetroVideoConverter:
                     label_name = self.size_label_for_width(w, {256: "レトロ小", 480: "レトロ中", 640: "標準", 1024: "高解像度"})
                 else:
                     label_name = self.size_label_for_width(h, {320: "レトロ小", 480: "レトロ中", 640: "標準", 1280: "高解像度", 1920: "フルHD"})
-                named.append((label_name, even_int(w), even_int(h)))
-
-            for label_name, w, h in named:
-                label = f"{label_name} - {w}x{h}"
+                label = f"{label_name} - {even_int(w)}x{even_int(h)}"
                 if label not in self.size_map:
-                    labels.append(label)
-                    self.size_map[label] = (w, h)
+                    self.size_map[label] = (even_int(w), even_int(h))
+                    added_labels.append(label)
         else:
             for width in (256, 320, 480, 640, 960, 1280, 1920):
                 height = even_int(width / ratio)
                 w = even_int(width)
                 label_name = self.size_label_for_width(width, {320: "レトロ小", 480: "レトロ中", 640: "標準", 1280: "高解像度", 1920: "大"})
                 label = f"{label_name} - {w}x{height}"
-                labels.append(label)
-                self.size_map[label] = (w, height)
+                if label not in self.size_map:
+                    self.size_map[label] = (w, height)
+                    added_labels.append(label)
 
-        labels.append("カスタム...")
-        self.size_combo.config(state="readonly")
+        self.last_loaded_size_labels = added_labels
+        current = self.size_var.get()
+        basic_labels = [
+            "現状維持",
+            "幅 256（縦横比維持）",
+            "幅 320（縦横比維持）",
+            "幅 480（縦横比維持）",
+            "幅 640（縦横比維持）",
+            "幅 960（縦横比維持）",
+            "幅 1280（縦横比維持）",
+            "幅 1920（縦横比維持）",
+        ]
+        custom_labels = [label for label in self.size_map.keys() if label.startswith("カスタム - ")]
+        labels = basic_labels + added_labels + custom_labels + ["カスタム..."]
         self.size_combo["values"] = tuple(labels)
-        default_label = labels[2] if len(labels) > 2 else labels[0]
-        self.size_var.set(default_label)
+        if current not in labels:
+            self.size_var.set("現状維持")
         self.on_size_selected()
 
     @staticmethod
@@ -510,16 +648,11 @@ class RetroVideoConverter:
         self.size_var.set(label)
         self.on_size_selected()
 
+    def get_selected_size_for_dimensions(self, src_w, src_h):
+        return self.resolve_size_for_dimensions(src_w, src_h, self.size_var.get(), self.size_map)
+
     def get_selected_size(self):
-        label = self.size_var.get()
-        if label in self.size_map:
-            return self.size_map[label]
-        parsed = parse_size_from_label(label)
-        if parsed:
-            return even_int(parsed[0]), even_int(parsed[1])
-        if self.video_w and self.video_h:
-            return even_int(self.video_w), even_int(self.video_h)
-        return None
+        return self.get_selected_size_for_dimensions(self.video_w, self.video_h)
 
     # ====================== プレビュー ======================
     def on_seek_changed(self, _value=None):
@@ -612,71 +745,122 @@ class RetroVideoConverter:
 
     # ====================== フレーム変換 ======================
     def get_resample_filter(self):
-        resize_mode = self.resize_var.get()
+        return self.get_resample_filter_for_value(self.resize_var.get())
+
+    @staticmethod
+    def get_resample_filter_for_value(resize_mode):
         if "Bilinear" in resize_mode:
             return Image.BILINEAR
         if "Nearest" in resize_mode:
             return Image.NEAREST
         return Image.BICUBIC
 
-    def process_frame(self, frame_img):
+    def collect_processing_settings(self):
+        """Tkinter変数をメインスレッドで読み取り、ワーカー用に固定する。"""
+        try:
+            colors = int(self.colors_var.get())
+        except ValueError:
+            colors = 8
+        try:
+            pre_thresh = float(self.var_pre_thresh.get())
+        except ValueError:
+            pre_thresh = 130.0
+        try:
+            post_thresh = float(self.var_post_thresh.get())
+        except ValueError:
+            post_thresh = 45.0
+        try:
+            chromatic_intensity = int(self.var_chromatic_intensity.get())
+        except ValueError:
+            chromatic_intensity = 2
+
+        return {
+            "size_label": self.size_var.get(),
+            "size_map": dict(self.size_map),
+            "resize_mode": self.resize_var.get(),
+            "pre_dot": self.var_pre_dot.get(),
+            "outline": self.var_outline.get(),
+            "anti_alias": self.var_anti_alias.get(),
+            "dot_boost": self.var_dot_boost.get(),
+            "skin_protect": self.var_exp_skin_protect.get(),
+            "colors": colors,
+            "pre_thresh": pre_thresh,
+            "post_thresh": post_thresh,
+            "preset": self.preset_var.get(),
+            "chromatic": self.var_chromatic.get(),
+            "chromatic_intensity": chromatic_intensity,
+        }
+
+    @staticmethod
+    def resolve_size_for_dimensions(src_w, src_h, label, size_map):
+        spec = size_map.get(label)
+        if spec is None and label == "現状維持":
+            if src_w <= 0 or src_h <= 0:
+                return None
+            return even_int(src_w), even_int(src_h)
+        if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "width":
+            if src_w <= 0 or src_h <= 0:
+                return None
+            target_w = even_int(spec[1])
+            target_h = even_int(target_w * src_h / src_w)
+            return target_w, target_h
+        if isinstance(spec, tuple) and len(spec) == 2:
+            return even_int(spec[0]), even_int(spec[1])
+        parsed = parse_size_from_label(label)
+        if parsed:
+            return even_int(parsed[0]), even_int(parsed[1])
+        if src_w and src_h:
+            return even_int(src_w), even_int(src_h)
+        return None
+
+    def process_frame(self, frame_img, target_size=None):
+        settings = self.collect_processing_settings()
+        return self.process_frame_with_settings(frame_img, settings, target_size=target_size)
+
+    def process_frame_with_settings(self, frame_img, settings, target_size=None):
         img = frame_img.convert("RGB")
-        target_size = self.get_selected_size()
+        if target_size is None:
+            target_size = self.resolve_size_for_dimensions(
+                img.size[0], img.size[1], settings.get("size_label", "現状維持"), settings.get("size_map", {})
+            )
         if target_size is None:
             target_size = img.size
         target_w, target_h = target_size
-        resample = self.get_resample_filter()
+        resample = self.get_resample_filter_for_value(settings.get("resize_mode", "Bicubic"))
 
         # 動画版では余白背景処理を削除。
         # 事前ドット化ON: 先に出力サイズへ縮小してから効果をかける。軽くてドット感が強い。
         # 事前ドット化OFF: 元解像度で効果をかけ、最後に出力サイズへ縮小する。少し滑らか寄り。
-        if self.var_pre_dot.get() and img.size != (target_w, target_h):
+        if settings.get("pre_dot", True) and img.size != (target_w, target_h):
             img = img.resize((target_w, target_h), resample)
 
-        if self.var_outline.get():
+        if settings.get("outline", False):
             img = self.enhance_outline_weak(img)
 
-        if self.var_anti_alias.get() and self.var_outline.get():
+        if settings.get("anti_alias", True) and settings.get("outline", False):
             img = self.apply_anti_alias_to_outline(img)
 
-        if self.var_dot_boost.get() != "なし":
-            img = self.dot_boost(img, self.var_dot_boost.get())
+        dot_boost_value = settings.get("dot_boost", "なし")
+        if dot_boost_value != "なし":
+            img = self.dot_boost(img, dot_boost_value)
 
-        if self.var_exp_skin_protect.get():
+        if settings.get("skin_protect", False):
             edges = img.filter(ImageFilter.FIND_EDGES).convert("L")
             smoothed = img.filter(ImageFilter.SMOOTH_MORE).filter(ImageFilter.SMOOTH_MORE)
             edge_mask = edges.point(lambda x: 255 if x > 20 else 0, "1")
             img = Image.composite(img, smoothed, edge_mask)
 
-        try:
-            colors = int(self.colors_var.get())
-        except ValueError:
-            colors = 8
-
-        try:
-            pre_thresh = float(self.var_pre_thresh.get())
-        except ValueError:
-            pre_thresh = 130.0
-
-        try:
-            post_thresh = float(self.var_post_thresh.get())
-        except ValueError:
-            post_thresh = 45.0
-
         img = self.bayer_ordered_dither(
             img,
-            colors,
-            self.preset_var.get(),
-            skin_protect=self.var_exp_skin_protect.get(),
-            pre_thresh=pre_thresh,
-            post_thresh=post_thresh
+            int(settings.get("colors", 8)),
+            settings.get("preset", ""),
+            skin_protect=bool(settings.get("skin_protect", False)),
+            pre_thresh=float(settings.get("pre_thresh", 130.0)),
+            post_thresh=float(settings.get("post_thresh", 45.0)),
         ).convert("RGB")
 
-        if self.var_chromatic.get():
-            try:
-                intensity = int(self.var_chromatic_intensity.get())
-            except ValueError:
-                intensity = 2
+        if settings.get("chromatic", False):
+            intensity = int(settings.get("chromatic_intensity", 2))
             img = self.apply_chromatic_aberration(img, intensity).convert("RGB")
 
         if img.size != (target_w, target_h):
@@ -838,61 +1022,260 @@ class RetroVideoConverter:
         boosted = small.resize((w, h), Image.NEAREST)
         return boosted.convert("RGB")
 
+    def get_selected_reencode_quality(self):
+        quality_name = self.reencode_quality_var.get()
+        quality = self.reencode_presets.get(quality_name)
+        if quality is None:
+            quality_name = self.default_reencode_preset_name
+            quality = self.reencode_presets[quality_name]
+            self.reencode_quality_var.set(quality_name)
+        return quality_name, quality
+
+    def get_ffmpeg_executable(self):
+        # video-cutter.py と同じ方針。スクリプトと同じフォルダの ffmpeg.exe を優先し、なければPATHを使う。
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_ffmpeg = os.path.join(script_dir, "ffmpeg.exe")
+        if os.path.exists(local_ffmpeg):
+            return local_ffmpeg
+        return shutil.which("ffmpeg")
+
+    def run_subprocess_capture(self, command):
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
     # ====================== 動画変換 ======================
-    def convert_video(self):
-        if not self.video_path or self.is_converting:
-            return
-
-        ffmpeg_path = shutil.which("ffmpeg")
-        if not ffmpeg_path:
-            messagebox.showerror(
-                "ffmpeg が見つかりません",
-                "ffmpeg が PATH にありません。\nffmpeg をインストールしてから再実行してね。"
-            )
-            return
-
+    def build_output_path_for_current_video(self):
         output_name = self.var_output_name.get().strip()
         if not output_name:
             base, _ = os.path.splitext(os.path.basename(self.video_path))
             output_name = f"{base}_retro.mp4"
         if not output_name.lower().endswith(".mp4"):
             output_name += ".mp4"
+        return os.path.join(os.path.dirname(os.path.abspath(self.video_path)), output_name)
 
-        output_path = os.path.join(os.path.dirname(os.path.abspath(self.video_path)), output_name)
+    def convert_video(self):
+        if not self.video_path or self.is_converting:
+            return
+
+        ffmpeg_path = self.get_ffmpeg_executable()
+        if not ffmpeg_path:
+            messagebox.showerror(
+                "ffmpeg が見つかりません",
+                "ffmpeg が見つかりません。\nffmpeg.exe をツールと同じフォルダに置くか、PATHに通してね。"
+            )
+            return
+
+        output_path = self.build_output_path_for_current_video()
         if os.path.abspath(output_path) == os.path.abspath(self.video_path):
             messagebox.showwarning("エラー", "入力動画と同じファイル名にはできません")
             return
 
-        target_size = self.get_selected_size()
+        target_size = self.get_selected_size_for_dimensions(self.video_w, self.video_h)
         if target_size is None:
             messagebox.showwarning("エラー", "出力サイズが不正です")
             return
-        target_w, target_h = target_size
 
-        self.is_converting = True
-        self.btn_convert.config(state="disabled")
-        self.btn_select.config(state="disabled")
-        self.btn_refresh_preview.config(state="disabled")
+        quality_name, quality = self.get_selected_reencode_quality()
+        settings = self.collect_processing_settings()
         self.progress_var.set(0)
-        self.lbl_progress.config(text="変換準備中...")
+        self.set_converting_ui(True, "変換準備中...")
+        self.start_worker(
+            self.convert_video_worker,
+            self.video_path,
+            output_path,
+            ffmpeg_path,
+            quality,
+            quality_name,
+            target_size,
+            settings,
+        )
+
+    def convert_video_worker(self, input_path, output_path, ffmpeg_path, quality, quality_name, target_size, settings):
+        try:
+            self.convert_one_video(
+                input_path=input_path,
+                output_path=output_path,
+                ffmpeg_path=ffmpeg_path,
+                quality=quality,
+                quality_name=quality_name,
+                target_size=target_size,
+                progress_prefix="変換中",
+                settings=settings,
+                progress_base=0.0,
+                progress_span=98.0,
+            )
+            self.ui_queue.put(("done_single", output_path, quality_name))
+        except Exception as e:
+            self.ui_queue.put(("error", "エラー", f"動画変換中にエラーが発生しました:\n{str(e)}"))
+
+    def set_converting_ui(self, converting, progress_text=None):
+        self.is_converting = converting
+        state = "disabled" if converting else "normal"
+        self.btn_select.config(state=state)
+        self.btn_convert.config(state="disabled" if converting or not self.video_path else "normal")
+        self.btn_refresh_preview.config(state="disabled" if converting or not self.video_path else "normal")
+        self.chk_folder_overwrite.config(state=state)
+        self.size_combo.config(state="disabled" if converting or self.preset_var.get() else "readonly")
+        self.colors_combo.config(state="disabled" if converting or self.preset_var.get() else "readonly")
+        if progress_text is not None:
+            self.lbl_progress.config(text=progress_text)
         self.root.update_idletasks()
 
+    def collect_videos_recursive(self, folder_path):
+        videos = []
+        for root_dir, dirnames, filenames in os.walk(folder_path):
+            dirnames[:] = [d for d in dirnames if not d.startswith("_backup.")]
+            for name in filenames:
+                path = os.path.join(root_dir, name)
+                if path.lower().endswith(VIDEO_EXTENSIONS):
+                    videos.append(path)
+        videos.sort(key=lambda p: p.lower())
+        return videos
+
+    def convert_folder_overwrite(self, folder_path):
+        if self.is_converting:
+            return
+
+        ffmpeg_path = self.get_ffmpeg_executable()
+        if not ffmpeg_path:
+            messagebox.showerror(
+                "ffmpeg が見つかりません",
+                "ffmpeg が見つかりません。\nffmpeg.exe をツールと同じフォルダに置くか、PATHに通してね。"
+            )
+            return
+
+        videos = self.collect_videos_recursive(folder_path)
+        if not videos:
+            messagebox.showwarning("エラー", "フォルダ内に有効な動画ファイルがありません")
+            return
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        backup_root = os.path.join(script_dir, "_backup." + datetime.now().strftime("%Y%m%d%H%M%S"))
+        folder_name = os.path.basename(os.path.normpath(folder_path)) or "folder"
+        quality_name, quality = self.get_selected_reencode_quality()
+        settings = self.collect_processing_settings()
+
+        self.progress_var.set(0)
+        self.set_converting_ui(True, f"フォルダ一括変換準備中... {len(videos)}件")
+        self.start_worker(
+            self.convert_folder_overwrite_worker,
+            folder_path,
+            videos,
+            ffmpeg_path,
+            backup_root,
+            folder_name,
+            quality,
+            quality_name,
+            settings,
+        )
+
+    def convert_folder_overwrite_worker(self, folder_path, videos, ffmpeg_path, backup_root, folder_name, quality, quality_name, settings):
+        converted = 0
+        failed = []
+        temp_dir = tempfile.mkdtemp(prefix="retro_overwrite_")
+
+        try:
+            for index, src_path in enumerate(videos, start=1):
+                rel = os.path.relpath(src_path, folder_path)
+                rel_for_backup = os.path.join(folder_name, rel)
+                backup_path = os.path.join(backup_root, rel_for_backup)
+                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+
+                suffix = os.path.splitext(src_path)[1] or ".mp4"
+                temp_output = os.path.join(temp_dir, f"converted_{index:05d}{suffix}")
+                item_base = (index - 1) / max(1, len(videos)) * 100.0
+                item_span = 100.0 / max(1, len(videos))
+
+                try:
+                    self.post_progress(item_base, f"バックアップ中 {index}/{len(videos)}: {os.path.basename(src_path)}")
+                    shutil.copy2(src_path, backup_path)
+
+                    w, h, _fps, _frames = self.get_video_basic_info(src_path)
+                    target_size = self.resolve_size_for_dimensions(
+                        w, h, settings.get("size_label", "現状維持"), settings.get("size_map", {})
+                    )
+                    if target_size is None:
+                        raise RuntimeError("出力サイズが不正です")
+
+                    self.convert_one_video(
+                        input_path=src_path,
+                        output_path=temp_output,
+                        ffmpeg_path=ffmpeg_path,
+                        quality=quality,
+                        quality_name=quality_name,
+                        target_size=target_size,
+                        progress_prefix=f"上書き変換中 {index}/{len(videos)}: {os.path.basename(src_path)}",
+                        settings=settings,
+                        progress_base=item_base,
+                        progress_span=item_span * 0.98,
+                    )
+                    os.replace(temp_output, src_path)
+                    converted += 1
+                    self.post_progress(item_base + item_span, f"完了 {index}/{len(videos)}: {os.path.basename(src_path)}")
+                except Exception as e:
+                    failed.append((src_path, str(e)))
+                    try:
+                        if os.path.exists(temp_output):
+                            os.remove(temp_output)
+                    except Exception:
+                        pass
+                    continue
+
+            self.ui_queue.put(("done_folder", converted, failed, backup_root, quality_name))
+        except Exception as e:
+            self.ui_queue.put(("error", "エラー", f"フォルダ一括変換中にエラーが発生しました:\n{str(e)}"))
+        finally:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def get_video_basic_info(self, path):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError("動画を開けませんでした")
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if fps <= 0:
+                fps = 30.0
+            if frames <= 0:
+                frames = 1
+            return w, h, fps, frames
+        finally:
+            cap.release()
+
+    def convert_one_video(self, input_path, output_path, ffmpeg_path, quality, quality_name, target_size, progress_prefix, settings, progress_base=0.0, progress_span=100.0):
+        target_w, target_h = target_size
         tmp_dir = tempfile.mkdtemp(prefix="retro_video_")
         temp_video_path = os.path.join(tmp_dir, "video_only.mp4")
 
+        cap = None
+        writer = None
         try:
-            cap = cv2.VideoCapture(self.video_path)
+            cap = cv2.VideoCapture(input_path)
             if not cap.isOpened():
                 raise RuntimeError("動画を開けませんでした")
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (target_w, target_h))
-            if not writer.isOpened():
-                raise RuntimeError("一時動画の書き出しを開始できませんでした")
-
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            fps = fps if fps and fps > 0 else 30.0
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total <= 0:
-                total = self.frame_count
+                total = 1
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (target_w, target_h))
+            if not writer.isOpened():
+                raise RuntimeError("一時動画の書き出しを開始できませんでした")
 
             start_time = time.time()
             frame_idx = 0
@@ -905,7 +1288,7 @@ class RetroVideoConverter:
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(frame_rgb).convert("RGB")
-                processed = self.process_frame(pil_img).convert("RGB")
+                processed = self.process_frame_with_settings(pil_img, settings, target_size=target_size).convert("RGB")
                 out_rgb = np.array(processed)
                 out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
                 writer.write(out_bgr)
@@ -916,71 +1299,60 @@ class RetroVideoConverter:
                     percent = min(100.0, frame_idx / max(1, total) * 100.0)
                     elapsed = now - start_time
                     fps_proc = frame_idx / elapsed if elapsed > 0 else 0
-                    self.progress_var.set(percent)
-                    self.lbl_progress.config(text=f"変換中... {frame_idx}/{total} フレーム ({percent:.1f}%) / {fps_proc:.1f} fps")
-                    self.root.update_idletasks()
+                    overall_percent = progress_base + (percent / 100.0) * progress_span
+                    self.post_progress(overall_percent, f"{progress_prefix}... {frame_idx}/{total} フレーム ({percent:.1f}%) / {fps_proc:.1f} fps")
                     last_ui_update = now
 
-            cap.release()
             writer.release()
+            writer = None
+            cap.release()
+            cap = None
 
-            self.lbl_progress.config(text="音声を結合中... ffmpeg 実行")
-            self.root.update_idletasks()
+            self.post_progress(progress_base + progress_span, f"エンコード中... {quality_name}")
 
-            # temp_video_path の映像 + 元動画の音声を結合。音声なしでも -map 1:a? で通す。
             ffmpeg_cmd = [
                 ffmpeg_path,
                 "-y",
                 "-i", temp_video_path,
-                "-i", self.video_path,
+                "-i", input_path,
                 "-map", "0:v:0",
                 "-map", "1:a?",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
-                "-crf", "18",
-                "-preset", "medium",
+                "-crf", quality["crf"],
+                "-preset", quality["preset"],
                 "-c:a", "aac",
-                "-b:a", "192k",
+                "-b:a", quality["audio_bitrate"],
                 "-shortest",
                 output_path,
             ]
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            result = self.run_subprocess_capture(ffmpeg_cmd)
             if result.returncode != 0:
-                # libx264 が使えない環境向けに、映像コピーで再試行する。
                 fallback_cmd = [
                     ffmpeg_path,
                     "-y",
                     "-i", temp_video_path,
-                    "-i", self.video_path,
+                    "-i", input_path,
                     "-map", "0:v:0",
                     "-map", "1:a?",
                     "-c:v", "copy",
                     "-c:a", "aac",
-                    "-b:a", "192k",
+                    "-b:a", quality.get("audio_bitrate", "192k"),
                     "-shortest",
                     output_path,
                 ]
-                fallback = subprocess.run(fallback_cmd, capture_output=True, text=True)
+                fallback = self.run_subprocess_capture(fallback_cmd)
                 if fallback.returncode != 0:
                     raise RuntimeError("ffmpeg での結合に失敗しました:\n" + fallback.stderr[-1200:])
-
-            self.progress_var.set(100)
-            self.lbl_progress.config(text=f"完了: {output_path}")
-            messagebox.showinfo("変換完了", f"動画変換が完了しました！\n{output_path}")
-
-        except Exception as e:
-            messagebox.showerror("エラー", f"動画変換中にエラーが発生しました:\n{str(e)}")
-            self.lbl_progress.config(text="エラーで停止")
         finally:
+            if writer is not None:
+                writer.release()
+            if cap is not None:
+                cap.release()
             try:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             except Exception:
                 pass
-            self.is_converting = False
-            self.btn_select.config(state="normal")
-            self.btn_refresh_preview.config(state="normal" if self.video_path else "disabled")
-            self.btn_convert.config(state="normal" if self.video_path else "disabled")
-            self.root.update_idletasks()
 
     def __del__(self):
         try:
